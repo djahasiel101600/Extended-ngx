@@ -29,14 +29,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  // Resolve the profile for the given token. Identity lookup falls back across
+  // several Paperless-ngx endpoints (see api.fetchCurrentUser), so a token that
+  // authenticates fine for documents but has no readable profile still yields a
+  // session — with `user: null` — rather than bouncing the user to /login.
+  // A rejected token (401) propagates here and clears the session.
+  const establishSession = async (token: string) => {
+    const user = await api.fetchCurrentUser();
+    setAuthState({ token, user, isAuthenticated: true });
+  };
+
   const validateToken = async () => {
+    const token = api.getToken();
+    if (!token) {
+      setIsLoading(false);
+      return;
+    }
     try {
-      const user = await api.getCurrentUser();
-      setAuthState({
-        token: api.getToken(),
-        user,
-        isAuthenticated: true,
-      });
+      await establishSession(token);
     } catch {
       api.clearToken();
       setAuthState({
@@ -52,42 +62,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const login = async (username: string, password: string) => {
     const { token } = await api.login(username, password);
     api.setToken(token);
-    
-    try {
-      const user = await api.getCurrentUser();
-      setAuthState({
-        token,
-        user,
-        isAuthenticated: true,
-      });
-    } catch {
-      // If we can't get user info, still consider logged in with token
-      setAuthState({
-        token,
-        user: null,
-        isAuthenticated: true,
-      });
-    }
+    await establishSession(token);
   };
 
   const loginWithToken = async (token: string) => {
     api.setToken(token);
-    
-    try {
-      const user = await api.getCurrentUser();
-      setAuthState({
-        token,
-        user,
-        isAuthenticated: true,
-      });
-    } catch {
-      // If we can't get user info, still consider logged in with token
-      setAuthState({
-        token,
-        user: null,
-        isAuthenticated: true,
-      });
-    }
+    await establishSession(token);
   };
 
   const logout = () => {

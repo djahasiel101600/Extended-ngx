@@ -1,5 +1,5 @@
-import { ReactNode } from 'react';
-import { ThemeToggle } from './ThemeToggle';
+import { type ReactNode } from 'react';
+import { AppHeader } from './AppHeader';
 
 interface LayoutProps {
   children: ReactNode;
@@ -8,11 +8,8 @@ interface LayoutProps {
 export function Layout({ children }: LayoutProps) {
   return (
     <div className="min-h-screen flex flex-col bg-background">
-      <header className="sticky top-0 z-50 border-b bg-background/95 backdrop-blur supports-backdrop-filter:bg-background/60 flex items-center justify-between px-4 h-14">
-        <span className="text-lg font-semibold">Paperless-ngx</span>
-        <ThemeToggle />
-      </header>
-      <main className="flex-1 container mx-auto px-4 py-6">
+      <AppHeader />
+      <main className="flex-1 container mx-auto px-4 py-6" role="main">
         {children}
       </main>
     </div>

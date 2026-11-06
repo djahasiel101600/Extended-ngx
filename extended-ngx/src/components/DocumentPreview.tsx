@@ -121,7 +121,7 @@ export function DocumentPreview({
 
   return (
     <Sheet open={isOpen} onOpenChange={(open) => !open && onClose()}>
-      <SheetContent className="w-full sm:max-w-xl p-4" onOpenAutoFocus={loadPreview} role="dialog" aria-modal="true" aria-label="Document Preview">
+      <SheetContent className="w-full sm:max-w-xl p-4" onOpenAutoFocus={loadPreview} role="dialog" aria-modal="true" aria-label="Document Preview" aria-describedby={undefined}>
         <SheetHeader>
           <div className="flex items-start justify-between">
             <SheetTitle className="text-lg font-semibold pr-8 line-clamp-2" tabIndex={0} aria-label="Document Title">

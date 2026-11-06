@@ -14,14 +14,15 @@ interface UserProfilePanelProps {
 export function UserProfilePanel({ isOpen, onClose }: UserProfilePanelProps) {
   const { user, logout } = useAuth();
 
+  // Hooks must run unconditionally, so declare state before the early return
+  // below (otherwise the "no user" render skips useState and shifts hook order).
+  const [showToken, setShowToken] = useState<boolean>(false);
+
   if (!user) return null;
 
   // If token is not part of user, get it from localStorage
   // @ts-ignore
   const token = user.token || localStorage.getItem('paperless_token');
-
-  const [showToken, setShowToken] = useState<boolean>(false);
-  // @ts-ignore
 
   const handleCopyToken = () => {
     if (token) {
@@ -32,7 +33,7 @@ export function UserProfilePanel({ isOpen, onClose }: UserProfilePanelProps) {
 
   return (
     <Sheet open={isOpen} onOpenChange={(open) => !open && onClose()}>
-      <SheetContent className="w-full sm:max-w-md" role="dialog" aria-modal="true" aria-label="User Profile">
+      <SheetContent className="w-full sm:max-w-md" role="dialog" aria-modal="true" aria-label="User Profile" aria-describedby={undefined}>
         <SheetHeader>
           <SheetTitle className="flex items-center gap-2">
             <User className="h-6 w-6 text-primary" aria-hidden="true" />

@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback, useRef, useEffect } from 'react';
+import { useState, useMemo, useCallback, useRef } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import {
   useReactTable,
@@ -11,7 +11,7 @@ import {
   type VisibilityState,
 } from '@tanstack/react-table';
 import { format } from 'date-fns';
-import { ArrowUpDown, ArrowUp, ArrowDown, Download, Loader2, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight } from 'lucide-react';
+import { ArrowUpDown, ArrowUp, ArrowDown, Download, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
   Table,
@@ -29,8 +29,9 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { Badge } from '@/components/ui/badge';
-import { ColumnVisibilityToggle } from './ColumnVisibilityToggle';
-import type { Document, CustomField, DocumentType, ColumnVisibility } from '@/types';
+import { ColumnManager } from './ColumnManager';
+import { buildColumnDefs, isColumnVisible } from '@/lib/columns';
+import type { Document, CustomField, DocumentType, ColumnVisibility, ColumnDefMeta } from '@/types';
 
 // Helper component for sortable headers
 const SortableHeader = ({ 
@@ -71,8 +72,13 @@ interface DocumentTableProps {
   onPageChange: (page: number) => void;
   onPageSizeChange: (size: number) => void;
   onRowClick: (document: Document) => void;
-  onExportCsv: (selectedDocs?: Document[]) => void;
-  isExporting: boolean;
+  onExport: () => void;
+  selectedIds: Set<number>;
+  onSelectedIdsChange: (ids: Set<number>) => void;
+  // Controlled column visibility (owned by DashboardPage so export can read it).
+  columnVisibility: ColumnVisibility;
+  onColumnVisibilityChange: (visibility: ColumnVisibility) => void;
+  onResetColumns: () => void;
 }
 
 export function DocumentTable({
@@ -86,23 +92,14 @@ export function DocumentTable({
   onPageChange,
   onPageSizeChange,
   onRowClick,
-  onExportCsv,
-  isExporting,
+  onExport,
+  selectedIds,
+  onSelectedIdsChange,
+  columnVisibility,
+  onColumnVisibilityChange,
+  onResetColumns,
 }: DocumentTableProps) {
-  // Debug logging
-  useEffect(() => {
-    console.log('Documents received:', documents);
-    console.log('Documents length:', documents?.length);
-    console.log('Custom fields:', customFields);
-    console.log('Document types:', documentTypes);
-    if (documents && documents.length > 0) {
-      console.log('First document keys:', Object.keys(documents[0]));
-      console.log('First document sample:', documents[0]);
-    }
-  }, [documents, customFields, documentTypes]);
-
   const [sorting, setSorting] = useState<SortingState>([]);
-  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   
   // Row selection logic
   const isAllSelected = useMemo(() => {
@@ -118,58 +115,54 @@ export function DocumentTable({
 
   const toggleAll = useCallback(() => {
     if (isAllSelected) {
-      setSelectedIds(new Set());
+      onSelectedIdsChange(new Set());
     } else {
-      setSelectedIds(new Set(documents.map((doc) => doc.id)));
+      onSelectedIdsChange(new Set(documents.map((doc) => doc.id)));
     }
-  }, [isAllSelected, documents]);
+  }, [isAllSelected, documents, onSelectedIdsChange]);
 
   const toggleOne = useCallback((id: number) => {
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) {
-        next.delete(id);
-      } else {
-        next.add(id);
-      }
-      return next;
-    });
-  }, []);
+    const next = new Set(selectedIds);
+    if (next.has(id)) {
+      next.delete(id);
+    } else {
+      next.add(id);
+    }
+    onSelectedIdsChange(next);
+  }, [selectedIds, onSelectedIdsChange]);
 
   // Event handlers
   const handlePageChange = useCallback((page: number) => onPageChange(page), [onPageChange]);
   const handlePageSizeChange = useCallback((size: number) => onPageSizeChange(size), [onPageSizeChange]);
   const handleRowClick = useCallback((doc: Document) => onRowClick(doc), [onRowClick]);
-  
-  const handleExportSelected = useCallback(() => {
-    if (selectedIds.size > 0) {
-      const selectedDocs = documents.filter((doc) => selectedIds.has(doc.id));
-      onExportCsv(selectedDocs);
-    } else {
-      onExportCsv();
-    }
-  }, [onExportCsv, selectedIds, documents]);
 
-  // Column visibility state
-  const [columnVisibility, setColumnVisibility] = useState<VisibilityState>(() => {
-    const defaultVisibility: VisibilityState = {
-      id: true,
-      title: true,
-      content: false,
-      created: true,
-      owner: false,
-      document_type: true,
-    };
-    
-    customFields.slice(0, 3).forEach((f) => {
-      defaultVisibility[`cf_${f.id}`] = true;
-    });
-    customFields.slice(3).forEach((f) => {
-      defaultVisibility[`cf_${f.id}`] = false;
-    });
-    
-    return defaultVisibility;
-  });
+  // Shared column catalog — the single source of truth reused by the column
+  // manager and export so all three agree on which columns exist.
+  const defs = useMemo<ColumnDefMeta[]>(() => buildColumnDefs(customFields), [customFields]);
+
+  // TanStack treats a missing key as visible, so give it an explicit boolean for
+  // every column, derived from the standardized defaults + user overrides.
+  const tanstackVisibility = useMemo<VisibilityState>(() => {
+    const map: VisibilityState = {};
+    defs.forEach((d) => { map[d.id] = isColumnVisible(columnVisibility, d.id); });
+    return map;
+  }, [defs, columnVisibility]);
+
+  // Only invoked if visibility changes via table internals; our ColumnManager
+  // writes overrides straight to the parent. Accepts TanStack's value-or-updater
+  // form and materializes a full snapshot back into explicit per-column overrides.
+  const setColumnVisibility = useCallback(
+    (updater: VisibilityState | ((old: VisibilityState) => VisibilityState)) => {
+      const next = typeof updater === 'function' ? updater(tanstackVisibility) : updater;
+      const overrides: ColumnVisibility = {};
+      defs.forEach((d) => {
+        const v = next[d.id];
+        if (v !== undefined) overrides[d.id] = v;
+      });
+      onColumnVisibilityChange(overrides);
+    },
+    [defs, tanstackVisibility, onColumnVisibilityChange],
+  );
 
   // Helper functions
   const getDocumentTypeName = useCallback((typeId: number | null) => {
@@ -213,30 +206,31 @@ export function DocumentTable({
     }
   }, [customFields]);
 
-  // Calculate monetary totals
+  // Calculate monetary totals for the footer aggregates. Columns whose effective
+  // visibility is false (explicitly hidden, or hidden-by-default) are skipped, so
+  // the totals never report a figure for data that isn't shown in the table.
   const monetaryTotals = useMemo(() => {
     const totals: Record<string, number> = {};
     customFields.forEach((field) => {
-      if (field.data_type === 'monetary') {
-        let total = 0;
-        documents.forEach((doc) => {
-          const cfValue = doc.custom_fields.find((cf) => cf.field === field.id);
-          if (cfValue?.value) {
-            const raw = String(cfValue.value).replace(/[^\d.-]/g, '');
-            const num = parseFloat(raw);
-            if (!isNaN(num)) total += num;
-          }
-        });
-        totals[field.name] = total;
-      }
+      if (field.data_type !== 'monetary') return;
+      if (!isColumnVisible(columnVisibility, `cf_${field.id}`)) return;
+
+      let total = 0;
+      documents.forEach((doc) => {
+        const cfValue = doc.custom_fields.find((cf) => cf.field === field.id);
+        if (cfValue?.value) {
+          const raw = String(cfValue.value).replace(/[^\d.-]/g, '');
+          const num = parseFloat(raw);
+          if (!isNaN(num)) total += num;
+        }
+      });
+      totals[field.name] = total;
     });
     return totals;
-  }, [documents, customFields]);
+  }, [documents, customFields, columnVisibility]);
 
   // Build columns
   const columns = useMemo<ColumnDef<Document>[]>(() => {
-    console.log('Building columns with documents length:', documents.length);
-    
     const baseColumns: ColumnDef<Document>[] = [
       {
         id: 'id',
@@ -272,18 +266,6 @@ export function DocumentTable({
         minSize: 150,
       },
       {
-        id: 'content',
-        accessorKey: 'content',
-        header: 'Content',
-        cell: ({ row }) => (
-          <div className="max-w-xs truncate text-muted-foreground" title={row.getValue('content')}>
-            {row.getValue('content') || '-'}
-          </div>
-        ),
-        size: 200,
-        minSize: 150,
-      },
-      {
         id: 'created',
         accessorKey: 'created',
         header: ({ column }) => (
@@ -306,14 +288,6 @@ export function DocumentTable({
         maxSize: 140,
       },
       {
-        id: 'owner',
-        accessorKey: 'owner',
-        header: 'Owner',
-        cell: ({ row }) => row.getValue('owner') || '-',
-        size: 150,
-        minSize: 100,
-      },
-      {
         id: 'document_type',
         accessorKey: 'document_type',
         header: 'Document Type',
@@ -327,6 +301,26 @@ export function DocumentTable({
         },
         size: 150,
         minSize: 120,
+      },
+      {
+        id: 'content',
+        accessorKey: 'content',
+        header: 'Content',
+        cell: ({ row }) => (
+          <div className="max-w-xs truncate text-muted-foreground" title={row.getValue('content')}>
+            {row.getValue('content') || '-'}
+          </div>
+        ),
+        size: 200,
+        minSize: 150,
+      },
+      {
+        id: 'owner',
+        accessorKey: 'owner',
+        header: 'Owner',
+        cell: ({ row }) => row.getValue('owner') || '-',
+        size: 150,
+        minSize: 100,
       },
     ];
 
@@ -368,7 +362,7 @@ export function DocumentTable({
     columns,
     state: {
       sorting,
-      columnVisibility,
+      columnVisibility: tanstackVisibility,
     },
     onSortingChange: setSorting,
     onColumnVisibilityChange: setColumnVisibility,
@@ -381,24 +375,6 @@ export function DocumentTable({
 
   // Get rows from table
   const rows = table.getRowModel().rows;
-  
-  // Debug table state
-  useEffect(() => {
-    console.log('Table rows:', rows.length);
-    console.log('Table columns:', table.getAllLeafColumns().map(c => ({ id: c.id, visible: c.getIsVisible() })));
-    console.log('Column visibility state:', columnVisibility);
-  }, [rows.length, table, columnVisibility]);
-
-  // Column definitions for visibility toggle
-  const columnDefs = useMemo(() => [
-    { id: 'id', label: 'ID' },
-    { id: 'title', label: 'Title' },
-    { id: 'content', label: 'Content' },
-    { id: 'created', label: 'Created' },
-    { id: 'owner', label: 'Owner' },
-    { id: 'document_type', label: 'Document Type' },
-    ...customFields.map((f) => ({ id: `cf_${f.id}`, label: f.name })),
-  ], [customFields]);
 
   // Virtualization setup - FIXED
   const parentRef = useRef<HTMLDivElement>(null);
@@ -411,56 +387,25 @@ export function DocumentTable({
 
   const virtualItems = rowVirtualizer.getVirtualItems();
   const totalSize = rowVirtualizer.getTotalSize();
-  
-  // Debug virtualization
-  useEffect(() => {
-    console.log('Virtual items count:', virtualItems.length);
-    console.log('Virtualization total size:', totalSize);
-    console.log('Parent ref exists:', !!parentRef.current);
-  }, [virtualItems.length, totalSize]);
 
   const totalPages = Math.ceil(totalCount / pageSize);
 
   return (
     <div className="space-y-4" aria-label="Document Table Section">
-      {/* Debug info - you can remove this after testing */}
-      <div className="bg-yellow-50 border border-yellow-200 rounded p-2 text-sm text-yellow-800">
-        <div>Documents: {documents?.length || 0}</div>
-        <div>Rows from table: {rows.length}</div>
-        <div>Virtual items: {virtualItems.length}</div>
-        <div>Total size: {totalSize}</div>
-        <div>Is loading: {isLoading.toString()}</div>
-      </div>
-
       {/* Toolbar */}
       <div className="flex flex-wrap items-center justify-between gap-2" aria-label="Table Toolbar">
         <div className="flex items-center gap-2">
-          <ColumnVisibilityToggle
-            columns={columnDefs}
-            visibility={columnVisibility as ColumnVisibility}
-            onVisibilityChange={(v) => setColumnVisibility(v)}
+          <ColumnManager
+            columns={defs}
+            visibility={columnVisibility}
+            onVisibilityChange={onColumnVisibilityChange}
+            onReset={onResetColumns}
           />
         </div>
         <div className="flex items-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={handleExportSelected}
-            disabled={isExporting || documents.length === 0 || (selectedIds.size > 0 && selectedIds.size === 0)}
-            aria-label={selectedIds.size > 0 ? 'Export selected documents to CSV' : 'Export all documents to CSV'}
-            title={selectedIds.size > 0 ? 'Export selected documents to CSV' : 'Export all filtered documents to CSV'}
-          >
-            {isExporting ? (
-              <>
-                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                Exporting...
-              </>
-            ) : (
-              <>
-                <Download className="h-4 w-4 mr-2" />
-                {selectedIds.size > 0 ? 'Export Selected' : 'Export All to CSV'}
-              </>
-            )}
+          <Button variant="outline" size="sm" onClick={onExport} disabled={documents.length === 0} aria-label="Export documents">
+            <Download className="h-4 w-4 mr-2" />
+            Export
           </Button>
         </div>
       </div>

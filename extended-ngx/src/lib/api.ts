@@ -4,8 +4,10 @@ import type {
   Document, 
   CustomField, 
   DocumentType, 
+  Tag,
   PaginatedResponse,
   DocumentFilters,
+  UiSettingsResponse,
   User
 } from '@/types';
 
@@ -14,6 +16,9 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000
 class ApiService {
   private client: AxiosInstance;
   private token: string | null = null;
+  // Caches the last tag-exclusion result set so paging through a client-side
+  // filtered view doesn't re-fetch every document on each page change.
+  private tagExcludeCache: { key: string; docs: Document[] } | null = null;
 
   constructor() {
     this.client = axios.create({
@@ -80,12 +85,112 @@ class ApiService {
   }
 
   async getCurrentUser(): Promise<User> {
-    const response = await this.client.get('/me/');
-    return response.data;
+    const user = await this.fetchCurrentUser();
+    if (!user) {
+      throw new Error('Unable to resolve the authenticated user from any API endpoint.');
+    }
+    return user;
+  }
+
+  // Resolve the authenticated user, tolerating Paperless-ngx versions that do not
+  // accept token auth on /me/ (it 302-redirects to the HTML login page there).
+  // Returns null when the identity cannot be determined for the current token.
+  async fetchCurrentUser(): Promise<User | null> {
+    // 1. Session-auth deployments expose the profile on /me/.
+    const me = await this.requestJson<User>('/me/');
+    if (me && typeof me.username === 'string') {
+      return me;
+    }
+
+    // 2. Token-auth deployments expose the *current* user on /ui_settings/.
+    const uiSettings = await this.requestJson<UiSettingsResponse>('/ui_settings/');
+    if (uiSettings?.user && typeof uiSettings.user.username === 'string') {
+      const partial = uiSettings.user;
+      // /ui_settings/ omits email, so enrich from the users list when reachable.
+      const email = await this.fetchEmailForUserId(partial.id);
+      return {
+        id: partial.id,
+        username: partial.username,
+        email,
+        first_name: partial.first_name ?? '',
+        last_name: partial.last_name ?? '',
+        is_superuser: partial.is_superuser ?? false,
+      };
+    }
+
+    // 3. Last resort: /api/me/ redirected to HTML, but the users list may still
+    //    be readable for this token.
+    const users = await this.requestJson<PaginatedResponse<User>>('/users/?page_size=1');
+    const first = Array.isArray(users?.results) ? users.results[0] : undefined;
+    return first ?? null;
+  }
+
+  // Look up a user's email from /users/, matching on id. Returns '' when the
+  // endpoint is unavailable (non-superuser tokens get 403 there) or the id is
+  // not present in the fetched page.
+  private async fetchEmailForUserId(userId: number): Promise<string> {
+    try {
+      const users = await this.requestJson<PaginatedResponse<Pick<User, 'id' | 'email'>>>('/users/?page_size=100');
+      const match = users?.results?.find((u) => u.id === userId);
+      return match?.email ?? '';
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.warn('Could not resolve email for user id', userId, error);
+      return '';
+    }
+  }
+
+  // GET that only accepts a JSON payload. Redirected HTML responses (login
+  // pages served for token-unsupported endpoints) are treated as a miss rather
+  // than an error, so callers can fall through to the next strategy.
+  // A 401 is re-thrown so the response interceptor can clear the session.
+  private async requestJson<T>(path: string): Promise<T | null> {
+    try {
+      const response = await this.client.get(path);
+      const data = response.data as unknown;
+      const contentType = String(response.headers?.['content-type'] ?? '');
+
+      if (data && typeof data === 'object') {
+        return data as T;
+      }
+      if (contentType.includes('json')) {
+        // Some deployments return a JSON string body; try to parse it.
+        try {
+          const parsed = JSON.parse(String(data));
+          return parsed && typeof parsed === 'object' ? (parsed as T) : null;
+        } catch {
+          return null;
+        }
+      }
+      return null;
+    } catch (error) {
+      const status = (error as AxiosError).response?.status;
+      if (status === 401) {
+        throw error;
+      }
+      // eslint-disable-next-line no-console
+      console.warn(`Request for ${path} did not return usable JSON.`, error);
+      return null;
+    }
   }
 
   // Documents
   async getDocuments(filters: DocumentFilters = {}): Promise<PaginatedResponse<Document>> {
+    // This backend does not honor any negated tag filter param, so tag
+    // exclusion is applied client-side over the non-tag-filtered results.
+    if (filters.excludeTagIds && filters.excludeTagIds.length > 0) {
+      const kept = await this.filterDocumentsExcludingTags(filters);
+      const page = filters.page ?? 1;
+      const size = filters.page_size ?? 25;
+      const start = (page - 1) * size;
+      return {
+        count: kept.length,
+        next: null,
+        previous: null,
+        results: kept.slice(start, start + size),
+      };
+    }
+
     const params = new URLSearchParams();
     
     if (filters.query) {
@@ -103,6 +208,12 @@ class ApiService {
     if (filters.custom_field_query) {
       params.append('custom_field_query', filters.custom_field_query);
     }
+    if (filters.tags__id__all) {
+      params.append('tags__id__all', filters.tags__id__all);
+    }
+    if (filters.tags__id__in) {
+      params.append('tags__id__in', filters.tags__id__in);
+    }
     if (filters.page) {
       params.append('page', filters.page.toString());
     }
@@ -115,6 +226,12 @@ class ApiService {
   }
 
   async getAllDocuments(filters: DocumentFilters = {}): Promise<Document[]> {
+    // Exclusion needs the full non-tag-filtered set to subtract from, so it
+    // bypasses the page-by-page loop below.
+    if (filters.excludeTagIds && filters.excludeTagIds.length > 0) {
+      return this.filterDocumentsExcludingTags(filters);
+    }
+
     const allDocuments: Document[] = [];
     let page = 1;
     let hasMore = true;
@@ -127,6 +244,40 @@ class ApiService {
     }
 
     return allDocuments;
+  }
+
+  // Fetch every document matching the NON-tag filters, then drop those that
+  // carry the selected tags. 'any' removes docs with at least one selected
+  // tag; 'all' removes only docs that carry every selected tag. Uses the
+  // document's `tags` array (returned by the list endpoint) since the API
+  // offers no server-side exclusion param. Results are cached by filter key.
+  private async filterDocumentsExcludingTags(filters: DocumentFilters): Promise<Document[]> {
+    const base: DocumentFilters = {
+      query: filters.query,
+      document_type__id: filters.document_type__id,
+      created__date__gte: filters.created__date__gte,
+      created__date__lte: filters.created__date__lte,
+      custom_field_query: filters.custom_field_query,
+    };
+    const ids = filters.excludeTagIds ?? [];
+    const mode = filters.excludeTagMatch ?? 'any';
+    const key = JSON.stringify({ base, ids, mode });
+
+    if (this.tagExcludeCache && this.tagExcludeCache.key === key) {
+      return this.tagExcludeCache.docs;
+    }
+
+    // `base` carries no tag params, so getAllDocuments takes the normal path.
+    const all = await this.getAllDocuments(base);
+    const kept = all.filter((d) => {
+      const docTags = d.tags ?? [];
+      return mode === 'all'
+        ? !ids.every((id) => docTags.includes(id))
+        : !ids.some((id) => docTags.includes(id));
+    });
+
+    this.tagExcludeCache = { key, docs: kept };
+    return kept;
   }
 
   async getDocument(id: number): Promise<Document> {
@@ -163,6 +314,11 @@ class ApiService {
   // Document Types
   async getDocumentTypes(): Promise<DocumentType[]> {
     return this.fetchAllPaginated<DocumentType>('/document_types/');
+  }
+
+  // Tags
+  async getTags(): Promise<Tag[]> {
+    return this.fetchAllPaginated<Tag>('/tags/');
   }
 
   // Helper to fetch paginated endpoints that either return a plain array
